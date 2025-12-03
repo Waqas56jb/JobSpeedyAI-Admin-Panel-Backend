@@ -3,6 +3,10 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import bcrypt from 'bcryptjs';
+import OpenAI from 'openai';
+import multer from 'multer';
+import pdfParse from 'pdf-parse';
+import PDFDocument from 'pdfkit';
 
 /**
  * Simple single-file Express API for Vercel / Neon
@@ -69,6 +73,10 @@ function getDbPool() {
 
 const pool = getDbPool();
 
+const openaiKey = process.env.OPENAI_API_KEY;
+const openaiClient = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
+const upload = multer(); // memory storage for PDF uploads
+
 // --- Express app ---
 const app = express();
 const port = process.env.PORT || 4000;
@@ -91,6 +99,162 @@ app.get('/api/db-health', async (req, res) => {
     res.json({ status: 'ok', result: result.rows[0] });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
+// --- AI Job Ad Generation ---
+app.post('/api/jobs/generate-ad', async (req, res) => {
+  const { description } = req.body || {};
+  if (!description) {
+    return res.status(400).json({ error: 'description is required' });
+  }
+  if (!openaiClient) {
+    return res.status(500).json({ error: 'OpenAI API key not configured' });
+  }
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: `You are a professional HR assistant that creates complete job postings.
+Return output strictly as JSON with this shape:
+{
+  "title": "string",
+  "company": "string",
+  "department": "string",
+  "location": "string",
+  "job_type": "string",
+  "category": "string",
+  "language": "string",
+  "status": "string",
+  "description": "string",
+  "required_skills": ["string"],
+  "requirements": ["string"]
+}`,
+        },
+        {
+          role: 'user',
+          content: `Generate a professional job post based on this input: ${description}`,
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content || '{}';
+    let jobData;
+    try {
+      jobData = JSON.parse(content);
+    } catch (_) {
+      const match =
+        content.match(/```json\s*([\s\S]*?)\s*```/) ||
+        content.match(/```\s*([\s\S]*?)\s*```/);
+      jobData = match ? JSON.parse(match[1]) : {};
+    }
+
+    const jobAd = {
+      title: jobData.title || 'Generated Role',
+      company: jobData.company || 'Your Company',
+      department: jobData.department || 'General',
+      location: jobData.location || 'Remote',
+      job_type: jobData.job_type || 'Full-time',
+      category: jobData.category || 'General',
+      language: jobData.language || 'English',
+      status: jobData.status || 'Open',
+      description: jobData.description || '',
+      required_skills: Array.isArray(jobData.required_skills)
+        ? jobData.required_skills
+        : typeof jobData.required_skills === 'string'
+          ? jobData.required_skills.split(',').map((s) => s.trim()).filter(Boolean)
+          : [],
+      requirements: Array.isArray(jobData.requirements)
+        ? jobData.requirements
+        : typeof jobData.requirements === 'string'
+          ? jobData.requirements.split(',').map((s) => s.trim()).filter(Boolean)
+          : [],
+    };
+
+    res.json({ jobAd });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('generate-ad error:', err);
+    res.status(500).json({ error: `Failed to generate job ad: ${err.message}` });
+  }
+});
+
+// --- Resume Parsing Tool ---
+app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+  if (req.file.mimetype !== 'application/pdf') {
+    return res.status(415).json({ error: 'Only PDF files are supported' });
+  }
+  if (!openaiClient) {
+    return res.status(500).json({ error: 'OpenAI API key not configured' });
+  }
+  try {
+    const pdfData = await pdfParse(req.file.buffer).catch(() => null);
+    const text = pdfData?.text?.slice(0, 100000) || '';
+    if (!text) {
+      return res.status(400).json({ error: 'Could not read PDF text' });
+  }
+
+    const prompt = `You are a resume parser. From the resume text below, extract a JSON object with this schema only:
+{
+  "contact": { "name": "string", "email": "string", "phone": "string", "location": "string" },
+  "summary": "string",
+  "skills": ["string"],
+  "experience": [
+    { "title": "string", "company": "string", "start_date": "string", "end_date": "string", "responsibilities": ["string"] }
+  ],
+  "education": [
+    { "degree": "string", "institution": "string", "year": "string" }
+  ],
+  "certifications": ["string"],
+  "languages": ["string"],
+  "links": ["string"]
+}
+Fill missing values with empty strings or empty arrays. Keep lists concise and deduplicated.
+Resume text:
+${text.substring(0, 12000)}`;
+
+    const completion = await openaiClient.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'You extract structured resume data and return JSON only.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content || '{}';
+    let parsed = {};
+    try {
+      parsed = JSON.parse(content);
+    } catch (_) {
+      const match =
+        content.match(/```json\s*([\s\S]*?)\s*```/) ||
+        content.match(/```\s*([\s\S]*?)\s*```/);
+      parsed = match ? JSON.parse(match[1]) : {};
+    }
+
+    const sanitizeArray = (value) =>
+      Array.isArray(value) ? value.map((v) => String(v).trim()).filter(Boolean) : [];
+
+    parsed.skills = sanitizeArray(parsed.skills);
+    parsed.certifications = sanitizeArray(parsed.certifications);
+    parsed.languages = sanitizeArray(parsed.languages);
+    parsed.links = sanitizeArray(parsed.links);
+    parsed.experience = Array.isArray(parsed.experience) ? parsed.experience : [];
+    parsed.education = Array.isArray(parsed.education) ? parsed.education : [];
+    parsed.contact = parsed.contact || { name: '', email: '', phone: '', location: '' };
+
+    res.json({ parsed });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('extract-skills error:', err);
+    res.status(500).json({ error: 'Failed to extract skills' });
   }
 });
 
@@ -201,6 +365,82 @@ app.get('/api/users/:id', async (req, res) => {
     res.json({ user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/users/:id/anonymized-pdf
+app.get('/api/users/:id/anonymized-pdf', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const userResult = await pool.query(
+      'select id, full_name, email, created_at from users where id = $1',
+      [id],
+    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const applicationResult = await pool.query(
+      `select a.ai_parsed_data, a.status, a.created_at, j.title as job_title
+       from applications a
+       inner join jobs j on j.id = a.job_id
+       where a.user_id = $1
+       order by a.created_at desc
+       limit 1`,
+      [id],
+    );
+
+    const candidate = userResult.rows[0];
+    const application = applicationResult.rows[0] || {};
+    const parsed = application.ai_parsed_data || {};
+
+    const doc = new PDFDocument({ margin: 50 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="anonymized_profile_${id}.pdf"`,
+    );
+    doc.pipe(res);
+
+    doc.fontSize(20).text('Anonymized Candidate Profile', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(14).text(`Candidate ID: #CND-${String(id).padStart(3, '0')}`);
+    doc.moveDown();
+    doc.fontSize(12).text(`Latest Application Status: ${application.status || 'N/A'}`);
+    if (application.job_title) doc.text(`Recent Role Applied: ${application.job_title}`);
+    doc.moveDown();
+
+    if (parsed.summary) {
+      doc.fontSize(14).text('Summary:');
+      doc.fontSize(12).text(parsed.summary, { align: 'justify' });
+      doc.moveDown();
+    }
+
+    if (Array.isArray(parsed.skills) && parsed.skills.length > 0) {
+      doc.fontSize(14).text('Skills:');
+      doc.fontSize(12).text(parsed.skills.join(', '));
+      doc.moveDown();
+    }
+
+    if (parsed.experience && Array.isArray(parsed.experience) && parsed.experience.length > 0) {
+      doc.fontSize(14).text('Experience:');
+      parsed.experience.slice(0, 3).forEach((exp) => {
+        doc.fontSize(12).text(`${exp.title || 'Role'} at ${exp.company || 'Company'}`);
+        doc.fontSize(10).text(`${exp.start_date || 'N/A'} - ${exp.end_date || 'Present'}`);
+        if (Array.isArray(exp.responsibilities) && exp.responsibilities.length > 0) {
+          doc.fontSize(10).list(exp.responsibilities.slice(0, 3));
+        }
+        doc.moveDown();
+      });
+    }
+
+    doc.fontSize(14).text('Generated At:');
+    doc.fontSize(12).text(new Date().toLocaleString());
+    doc.end();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('anonymized-pdf error:', err);
+    res.status(500).json({ error: 'Failed to generate PDF' });
   }
 });
 
@@ -350,6 +590,101 @@ app.delete('/api/jobs/:id', async (req, res) => {
   }
 });
 
+// GET /api/jobs/:id/xml-feed/:portal
+app.get('/api/jobs/:id/xml-feed/:portal', async (req, res) => {
+  const { id, portal } = req.params;
+  try {
+    const result = await pool.query('select * from jobs where id = $1', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    const job = result.rows[0];
+    const skills = Array.isArray(job.requirements || job.required_skills)
+      ? (job.requirements || job.required_skills).join(', ')
+      : String(job.requirements || job.required_skills || '');
+    const createdAt = new Date(job.created_at).toISOString();
+
+    const xmlTemplates = {
+      indeed: `<?xml version="1.0" encoding="UTF-8"?>
+<jobs>
+  <job>
+    <title><![CDATA[${job.title || ''}]]></title>
+    <company><![CDATA[${job.department || job.company || ''}]]></company>
+    <location><![CDATA[${job.location || ''}]]></location>
+    <jobtype><![CDATA[${job.job_type || job.status || 'Full-time'}]]></jobtype>
+    <category><![CDATA[${job.category || 'General'}]]></category>
+    <description><![CDATA[${job.description || ''}]]></description>
+    <required_skills><![CDATA[${skills}]]></required_skills>
+    <url><![CDATA[https://jobspeedy-ai.com/jobs/${job.id}]]></url>
+    <date><![CDATA[${createdAt}]]></date>
+  </job>
+</jobs>`,
+      glassdoor: `<?xml version="1.0" encoding="UTF-8"?>
+<source>
+  <publisher>JobSpeedy AI</publisher>
+  <publisherurl>https://jobspeedy-ai.com</publisherurl>
+  <lastBuildDate>${new Date().toISOString()}</lastBuildDate>
+  <job>
+    <title><![CDATA[${job.title || ''}]]></title>
+    <employer><![CDATA[${job.department || job.company || ''}]]></employer>
+    <location><![CDATA[${job.location || ''}]]></location>
+    <jobtype><![CDATA[${job.job_type || job.status || 'Full-time'}]]></jobtype>
+    <description><![CDATA[${job.description || ''}]]></description>
+    <skills><![CDATA[${skills}]]></skills>
+    <url><![CDATA[https://jobspeedy-ai.com/jobs/${job.id}]]></url>
+    <date><![CDATA[${createdAt}]]></date>
+  </job>
+</source>`,
+      linkedin: `<?xml version="1.0" encoding="UTF-8"?>
+<source>
+  <publisherName>JobSpeedy AI</publisherName>
+  <publisherUrl>https://jobspeedy-ai.com</publisherUrl>
+  <lastBuildDate>${new Date().toISOString()}</lastBuildDate>
+  <job>
+    <jobId>${job.id}</jobId>
+    <title><![CDATA[${job.title || ''}]]></title>
+    <companyName><![CDATA[${job.department || job.company || ''}]]></companyName>
+    <location><![CDATA[${job.location || ''}]]></location>
+    <jobType><![CDATA[${job.job_type || job.status || 'FULL_TIME'}]]></jobType>
+    <description><![CDATA[${job.description || ''}]]></description>
+    <skills><![CDATA[${skills}]]></skills>
+    <url><![CDATA[https://jobspeedy-ai.com/jobs/${job.id}]]></url>
+    <postedDate>${createdAt}</postedDate>
+  </job>
+</source>`,
+      generic: `<?xml version="1.0" encoding="UTF-8"?>
+<jobfeed>
+  <job>
+    <id>${job.id}</id>
+    <title><![CDATA[${job.title || ''}]]></title>
+    <company><![CDATA[${job.department || job.company || ''}]]></company>
+    <location><![CDATA[${job.location || ''}]]></location>
+    <job_type><![CDATA[${job.job_type || job.status || 'Full-time'}]]></job_type>
+    <category><![CDATA[${job.category || 'General'}]]></category>
+    <description><![CDATA[${job.description || ''}]]></description>
+    <required_skills><![CDATA[${skills}]]></required_skills>
+    <url>https://jobspeedy-ai.com/jobs/${job.id}</url>
+    <created_at>${createdAt}</created_at>
+  </job>
+</jobfeed>`,
+    };
+
+    const key = (portal || 'generic').toLowerCase();
+    const xml = xmlTemplates[key];
+    if (!xml) {
+      return res.status(400).json({ error: 'Unsupported portal' });
+    }
+
+    res.setHeader('Content-Type', 'application/xml');
+    res.setHeader('Content-Disposition', `attachment; filename="job_${job.id}_${key}.xml"`);
+    res.send(xml);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('xml-feed error:', err);
+    res.status(500).json({ error: 'Failed to generate XML feed' });
+  }
+});
+
 // --- APPLICATIONS ---
 
 // GET /api/applications
@@ -455,7 +790,20 @@ app.get('/api/users/:id/applications', async (req, res) => {
 app.get('/api/clients', async (req, res) => {
   try {
     const result = await pool.query(
-      'select * from clients order by created_at desc'
+      `select 
+         c.id,
+         c.company,
+         c.contact_person,
+         c.email,
+         c.created_at,
+         (
+           select count(1)
+           from jobs j
+           where j.client_id = c.id
+              or (j.department is not null and j.department = c.company)
+         ) as jobs_count
+       from clients c
+       order by c.created_at desc`,
     );
     res.json({ clients: result.rows });
   } catch (err) {
