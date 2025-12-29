@@ -453,11 +453,11 @@ app.delete('/api/users/:id', async (req, res) => {
       [id]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ message: 'User not found' });
     }
-    res.json({ message: 'User deleted', id: result.rows[0].id });
+    res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ message: err.message });
   }
 });
 
@@ -691,11 +691,9 @@ app.get('/api/jobs/:id/xml-feed/:portal', async (req, res) => {
 app.get('/api/applications', async (req, res) => {
   try {
     const result = await pool.query(
-      `select a.*, u.full_name, u.email, j.title as job_title
-       from applications a
-       join users u on u.id = a.user_id
-       join jobs j on j.id = a.job_id
-       order by a.created_at desc`
+      `select id, user_id, job_id, created_at
+       from applications
+       order by created_at desc`
     );
     res.json({ applications: result.rows });
   } catch (err) {
@@ -795,17 +793,18 @@ app.get('/api/clients', async (req, res) => {
          c.company,
          c.contact_person,
          c.email,
-         c.created_at,
-         (
-           select count(1)
-           from jobs j
-           where j.client_id = c.id
-              or (j.department is not null and j.department = c.company)
-         ) as jobs_count
+         c.created_at
        from clients c
        order by c.created_at desc`,
     );
-    res.json({ clients: result.rows });
+    // Map company to name and add status field for frontend compatibility
+    const clients = result.rows.map(client => ({
+      id: client.id,
+      name: client.company, // Map company to name
+      status: 'active', // Default status for all clients
+      created_at: client.created_at
+    }));
+    res.json({ clients });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
